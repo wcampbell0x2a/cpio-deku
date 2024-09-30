@@ -12,6 +12,23 @@ use thiserror::Error;
 const MAGIC: [u8; 6] = [b'0', b'7', b'0', b'7', b'0', b'1'];
 const TRAILER: &str = "TRAILER!!!";
 
+trait CpioHeader: for<'a> DekuReader<'a> + DekuWriter {
+    fn ino(&self) -> u32;
+    fn mode(&self) -> u32;
+    fn uid(&self) -> u32;
+    fn gid(&self) -> u32;
+    fn nlink(&self) -> u32;
+    fn mtime(&self) -> u32;
+    fn filesize(&self) -> u32;
+    fn devmajor(&self) -> u32;
+    fn devminor(&self) -> u32;
+    fn rdevmajor(&self) -> u32;
+    fn rdevminor(&self) -> u32;
+    fn namesize(&self) -> u32;
+    fn check(&self) -> u32;
+    fn from_header(header: Header, namesize: u32, filesize: u64) -> Self;
+}
+
 // Much like DekuWriter, but lets us mutate ourself
 trait MutWriter<Ctx = ()> {
     fn to_mutwriter<W: Write + Seek>(
@@ -68,14 +85,18 @@ impl<R: ReadSeek> Seek for ReaderWithOffset<R> {
 
 impl<T: ReadSeek> CpioReader for T {}
 pub trait CpioReader: ReadSeek {
-    fn extract_data<W>(&mut self, object: &Object, writer: &mut W) -> Result<(), CpioError>
+    fn extract_data<W, C: CpioHeader>(
+        &mut self,
+        object: &Object<C>,
+        writer: &mut W,
+    ) -> Result<(), CpioError>
     where
         W: Write + Seek,
     {
         // found the file, seek forward
         if let Data::Offset(offset) = object.data {
             self.seek(SeekFrom::Start(offset)).unwrap();
-            let mut buf = vec![0; object.header.filesize.value as usize];
+            let mut buf = vec![0; object.header.filesize() as usize];
             self.read_exact(&mut buf).unwrap();
             writer.write_all(&buf)?;
             Ok(())
@@ -138,12 +159,12 @@ impl MutWriter<u32> for Data {
 }
 
 #[derive(DekuRead)]
-pub struct Objects {
+pub struct Objects<C: CpioHeader> {
     #[deku(until = "Self::until")]
-    pub inner: Vec<Object>,
+    pub inner: Vec<Object<C>>,
 }
 
-impl MutWriter for Objects {
+impl<C: CpioHeader> MutWriter for Objects<C> {
     fn to_mutwriter<W: Write + Seek>(
         &mut self,
         deku_writer: &mut Writer<W>,
@@ -156,18 +177,18 @@ impl MutWriter for Objects {
     }
 }
 
-impl Objects {
-    fn until(last_object: &Object) -> bool {
+impl<C: CpioHeader> Objects<C> {
+    fn until(last_object: &Object<C>) -> bool {
         last_object.name.to_str() == Ok(TRAILER)
     }
 }
 
-pub struct ArchiveReader<'b> {
+pub struct ArchiveReader<'b, C: CpioHeader> {
     pub reader: Box<dyn ReadSeek + 'b>,
-    pub objects: Objects,
+    pub objects: Objects<C>,
 }
 
-impl<'b> ArchiveReader<'b> {
+impl<'b, C: CpioHeader> ArchiveReader<'b, C> {
     pub fn from_reader(reader: impl ReadSeek + 'b) -> Result<Self, CpioError> {
         Self::from_reader_with_offset(reader, 0)
     }
@@ -208,13 +229,13 @@ impl<'b> ArchiveReader<'b> {
 pub trait WriteSeek: std::io::Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}
 
-pub struct ArchiveWriter<'a> {
+pub struct ArchiveWriter<'a, C: CpioHeader> {
     pub writer: Box<dyn WriteSeek + 'a>,
-    pub objects: Objects,
+    pub objects: Objects<C>,
     pad_len: u32,
 }
 
-impl<'a> ArchiveWriter<'a> {
+impl<'a, C: CpioHeader> ArchiveWriter<'a, C> {
     pub fn new(writer: Box<dyn WriteSeek + 'a>) -> Self {
         Self { writer, objects: Objects { inner: vec![] }, pad_len: 0x400 }
     }
@@ -229,30 +250,15 @@ impl<'a> ArchiveWriter<'a> {
         let filesize = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
-        let namesize = Ascii::new(u32::try_from(path.as_bytes().len() + 1).unwrap());
-        let cpio_header = CpioNewcHeader {
-            magic: MAGIC,
-            ino: Ascii::new(header.ino),
-            mode: Ascii::new(header.mode),
-            uid: Ascii::new(header.uid),
-            gid: Ascii::new(header.gid),
-            nlink: Ascii::new(header.nlink),
-            mtime: Ascii::new(header.mtime),
-            filesize: Ascii::new(u32::try_from(filesize).unwrap()),
-            devmajor: Ascii::new(header.devmajor),
-            devminor: Ascii::new(header.devminor),
-            rdevmajor: Ascii::new(header.rdevmajor),
-            rdevminor: Ascii::new(header.rdevminor),
-            namesize,
-            check: Ascii::new(0),
-        };
+        let namesize = u32::try_from(path.as_bytes().len() + 1).unwrap();
+        let header = C::from_header(header, namesize, filesize);
 
-        let object = Object {
-            header: cpio_header,
-            name: CString::new(path.as_bytes()).unwrap(),
-            name_pad: vec![0; pad_to_4(6 + namesize.value as usize)],
-            data: Data::Reader(Box::new(reader)),
-        };
+        let object = Object::new(
+            header,
+            CString::new(path.as_bytes()).unwrap(),
+            vec![0; pad_to_4(6 + namesize as usize)],
+            Data::Reader(Box::new(reader)),
+        );
 
         self.objects.inner.push(object);
 
@@ -260,6 +266,7 @@ impl<'a> ArchiveWriter<'a> {
     }
 
     /// Before writing to Writer, a "TRAILER!!!" entry must be added
+    // TODO: The new ASCII format is limited to 4 gigabyte file sizes.
     pub fn write(&mut self) -> Result<(), CpioError> {
         let header = Header { nlink: 1, ..Default::default() };
 
@@ -316,20 +323,26 @@ pub struct Header {
 }
 
 #[derive(DekuRead)]
-pub struct Object {
-    pub header: CpioNewcHeader,
+pub struct Object<C: CpioHeader> {
+    pub header: C,
 
-    #[deku(assert = "name.as_bytes().len() == header.namesize.value as usize - 1")]
+    #[deku(assert = "name.as_bytes().len() == header.namesize() as usize - 1")]
     pub name: CString,
 
-    #[deku(count = "pad_to_4(6 + header.namesize.value as usize)")]
+    #[deku(count = "pad_to_4(6 + header.namesize() as usize)")]
     name_pad: Vec<u8>,
 
-    #[deku(ctx = "header.filesize.value")]
+    #[deku(ctx = "header.filesize()")]
     data: Data,
 }
 
-impl MutWriter for Object {
+impl<C: CpioHeader> Object<C> {
+    pub fn new(header: C, name: CString, name_pad: Vec<u8>, data: Data) -> Self {
+        Self { header, name, name_pad, data }
+    }
+}
+
+impl<C: CpioHeader> MutWriter for Object<C> {
     fn to_mutwriter<W: Write + Seek>(
         &mut self,
         deku_writer: &mut Writer<W>,
@@ -337,19 +350,19 @@ impl MutWriter for Object {
     ) -> core::result::Result<(), DekuError> {
         DekuWriter::to_writer(&self.header, deku_writer, ())?;
 
-        if self.name.as_bytes().len() != self.header.namesize.value as usize - 1 {
+        if self.name.as_bytes().len() != self.header.namesize() as usize - 1 {
             panic!("add assert here");
         }
         DekuWriter::to_writer(&self.name, deku_writer, ())?;
         DekuWriter::to_writer(&self.name_pad, deku_writer, ())?;
-        self.data.to_mutwriter(deku_writer, self.header.filesize.value)?;
+        self.data.to_mutwriter(deku_writer, self.header.filesize())?;
         Ok(())
     }
 }
 
 /// The new (SVR4) portable format, which supports file systems having more than 65536 i-nodes. (4294967295 bytes)
 #[derive(DekuWrite, DekuRead, Debug)]
-pub struct CpioNewcHeader {
+pub struct NewcHeader {
     #[deku(assert_eq = "MAGIC")]
     pub magic: [u8; 6],
     pub ino: Ascii,
@@ -365,6 +378,78 @@ pub struct CpioNewcHeader {
     pub rdevminor: Ascii,
     pub namesize: Ascii,
     pub check: Ascii,
+}
+
+impl CpioHeader for NewcHeader {
+    fn from_header(header: Header, namesize: u32, filesize: u64) -> Self {
+        NewcHeader {
+            magic: MAGIC,
+            ino: Ascii::new(header.ino),
+            mode: Ascii::new(header.mode),
+            uid: Ascii::new(header.uid),
+            gid: Ascii::new(header.gid),
+            nlink: Ascii::new(header.nlink),
+            mtime: Ascii::new(header.mtime),
+            filesize: Ascii::new(u32::try_from(filesize).unwrap()),
+            devmajor: Ascii::new(header.devmajor),
+            devminor: Ascii::new(header.devminor),
+            rdevmajor: Ascii::new(header.rdevmajor),
+            rdevminor: Ascii::new(header.rdevminor),
+            namesize: Ascii::new(namesize),
+            check: Ascii::new(0),
+        }
+    }
+    fn ino(&self) -> u32 {
+        self.ino.value
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.value
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid.value
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.value
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.value
+    }
+
+    fn mtime(&self) -> u32 {
+        self.mtime.value
+    }
+
+    fn filesize(&self) -> u32 {
+        self.filesize.value
+    }
+
+    fn devmajor(&self) -> u32 {
+        self.devmajor.value
+    }
+
+    fn devminor(&self) -> u32 {
+        self.devminor.value
+    }
+
+    fn rdevmajor(&self) -> u32 {
+        self.rdevmajor.value
+    }
+
+    fn rdevminor(&self) -> u32 {
+        self.rdevminor.value
+    }
+
+    fn namesize(&self) -> u32 {
+        self.namesize.value
+    }
+
+    fn check(&self) -> u32 {
+        self.check.value
+    }
 }
 
 /// pad out to a multiple of 4 bytes

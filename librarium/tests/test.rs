@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::io::Read;
 use std::{ffi::CString, io::Cursor};
 
+use librarium::NewcHeader;
 use librarium::{ArchiveReader, ArchiveWriter, Header};
 use test_assets::TestAssetDef;
 
@@ -26,7 +27,8 @@ fn test_simple_in_out_newc_files() {
     test_assets::download_test_files(&asset_defs, TEST_PATH, true).unwrap();
 
     let mut file = BufReader::new(File::open(&og_path).unwrap());
-    let mut archive = ArchiveReader::from_reader_with_offset(&mut file, 0).unwrap();
+    let mut archive: ArchiveReader<NewcHeader> =
+        ArchiveReader::from_reader_with_offset(&mut file, 0).unwrap();
 
     let a_assert = "a\n".as_bytes();
     let b_assert = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n".as_bytes();
@@ -45,7 +47,7 @@ fn test_simple_in_out_newc_files() {
     assert_eq!(c.into_inner(), c_assert);
 
     let file = File::create(&new_path).unwrap();
-    let mut writer = ArchiveWriter::new(Box::new(file));
+    let mut writer: ArchiveWriter<NewcHeader> = ArchiveWriter::new(Box::new(file));
 
     // A
     let header_a = Header {

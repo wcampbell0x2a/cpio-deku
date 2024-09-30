@@ -4,7 +4,7 @@ use std::io::{BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use librarium::{ArchiveReader, CpioReader};
+use librarium::{ArchiveReader, CpioReader, NewcHeader};
 
 use clap::builder::styling::*;
 pub fn styles() -> clap::builder::Styles {
@@ -46,7 +46,8 @@ fn main() {
     file.seek(SeekFrom::Start(args.offset)).unwrap();
 
     // Extract all
-    let mut archive = ArchiveReader::from_reader_with_offset(&mut file, args.offset).unwrap();
+    let mut archive: ArchiveReader<NewcHeader> =
+        ArchiveReader::from_reader_with_offset(&mut file, args.offset).unwrap();
     for object in &archive.objects.inner {
         let filepath = Path::new(&args.dest).join(object.name.clone().into_string().unwrap());
 
