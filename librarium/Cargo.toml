@@ -21,9 +21,13 @@ std = ["deku/std", "alloc"]
 alloc = ["deku/alloc"]
 
 [dependencies]
-deku = { version = "0.18.1", features = ["std"], default-features = false }
+deku = { version = "0.18.1", features = ["std", "logging"], default-features = false }
+log = "*"
+num = "0.4.3"
+num-traits = "0.2.19"
 thiserror = "1.0.52"
 
 [dev-dependencies]
 tempfile = "3.9.0"
 test-assets = { git  = "https://github.com/wcampbell0x2a/test-assets", branch = "replace-curl-ureq" }
+test-log = "0.2.16"

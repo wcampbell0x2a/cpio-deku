@@ -22,4 +22,5 @@ bench = false
 
 [dependencies]
 clap = { version = "4.4.12", features = ["derive"] }
+env_logger = "0.11.5"
 librarium = { path = "../librarium", version = "0.2.0" }

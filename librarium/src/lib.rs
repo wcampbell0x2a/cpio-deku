@@ -1,18 +1,23 @@
 //! Copy in/out file archives
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::fmt::{self, Debug};
 use std::io::{self, Cursor};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::ParseIntError;
 
 use deku::prelude::*;
 use deku::writer::Writer;
 use deku::DekuError;
+use num::Integer;
 use thiserror::Error;
 
 const MAGIC: [u8; 6] = [b'0', b'7', b'0', b'7', b'0', b'1'];
 const TRAILER: &str = "TRAILER!!!";
 
-trait CpioHeader: for<'a> DekuReader<'a> + DekuWriter {
+pub trait CpioHeader: for<'a> DekuReader<'a> + DekuWriter {
+    fn into_header(&self) -> Header;
+    fn from_header(header: Header, filesize: u64) -> Self;
     fn ino(&self) -> u32;
     fn mode(&self) -> u32;
     fn uid(&self) -> u32;
@@ -20,13 +25,14 @@ trait CpioHeader: for<'a> DekuReader<'a> + DekuWriter {
     fn nlink(&self) -> u32;
     fn mtime(&self) -> u32;
     fn filesize(&self) -> u32;
-    fn devmajor(&self) -> u32;
-    fn devminor(&self) -> u32;
-    fn rdevmajor(&self) -> u32;
-    fn rdevminor(&self) -> u32;
+    // fn devmajor(&self) -> u32;
+    // fn devminor(&self) -> u32;
+    // fn rdevmajor(&self) -> u32;
+    // fn rdevminor(&self) -> u32;
     fn namesize(&self) -> u32;
-    fn check(&self) -> u32;
-    fn from_header(header: Header, namesize: u32, filesize: u64) -> Self;
+    // fn check(&self) -> u32;
+    fn name(&self) -> &str;
+    fn data_pad(&self) -> usize;
 }
 
 // Much like DekuWriter, but lets us mutate ourself
@@ -123,9 +129,11 @@ impl DekuReader<'_, u32> for Data {
 
         // Save the current offset, this is where the file exists for reading later
         let current_pos = reader.stream_position().unwrap();
+        dbg!(current_pos);
 
         // Seek past that file
-        let position = filesize as i64 + pad_to_4(filesize as usize) as i64;
+        let position = filesize as i64;
+        dbg!(position);
         let _ = reader.seek(SeekFrom::Current(position));
 
         Ok(Self::Offset(current_pos))
@@ -179,7 +187,7 @@ impl<C: CpioHeader> MutWriter for Objects<C> {
 
 impl<C: CpioHeader> Objects<C> {
     fn until(last_object: &Object<C>) -> bool {
-        last_object.name.to_str() == Ok(TRAILER)
+        last_object.header.name().as_bytes() == TRAILER.as_bytes()
     }
 }
 
@@ -209,16 +217,16 @@ impl<'b, C: CpioHeader> ArchiveReader<'b, C> {
 
     pub fn extract_by_name<W>(
         &mut self,
-        name: CString,
+        name: &str,
         writer: &mut W,
-    ) -> Result<Option<()>, CpioError>
+    ) -> Result<Option<Header>, CpioError>
     where
         W: Write + Seek,
     {
         for object in &self.objects.inner {
-            if name == object.name {
+            if name == object.header.name() {
                 self.reader.extract_data(object, writer)?;
-                return Ok(Some(()));
+                return Ok(Some(object.header.into_header()));
             }
         }
 
@@ -243,23 +251,14 @@ impl<'a, C: CpioHeader> ArchiveWriter<'a, C> {
     pub fn push_file(
         &mut self,
         mut reader: impl ReadSeek + 'a + 'static,
-        path: CString,
         header: Header,
     ) -> Result<(), CpioError> {
         // stream_len
         let filesize = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
-        let namesize = u32::try_from(path.as_bytes().len() + 1).unwrap();
-        let header = C::from_header(header, namesize, filesize);
-
-        let object = Object::new(
-            header,
-            CString::new(path.as_bytes()).unwrap(),
-            vec![0; pad_to_4(6 + namesize as usize)],
-            Data::Reader(Box::new(reader)),
-        );
-
+        let header = C::from_header(header, filesize);
+        let object = Object::new(header, Data::Reader(Box::new(reader)));
         self.objects.inner.push(object);
 
         Ok(())
@@ -268,12 +267,11 @@ impl<'a, C: CpioHeader> ArchiveWriter<'a, C> {
     /// Before writing to Writer, a "TRAILER!!!" entry must be added
     // TODO: The new ASCII format is limited to 4 gigabyte file sizes.
     pub fn write(&mut self) -> Result<(), CpioError> {
-        let header = Header { nlink: 1, ..Default::default() };
+        let header = Header { nlink: 1, name: "TRAILER!!!".to_string(), ..Default::default() };
 
         // empty data
         let data = Cursor::new(vec![]);
-        let path = CString::new("TRAILER!!!").unwrap();
-        self.push_file(data, path, header)?;
+        self.push_file(data, header)?;
 
         let mut writer = Writer::new(&mut self.writer);
         self.objects.to_mutwriter(&mut writer, ()).unwrap();
@@ -320,25 +318,22 @@ pub struct Header {
     pub devminor: u32,
     pub rdevmajor: u32,
     pub rdevminor: u32,
+    pub name: String,
 }
 
 #[derive(DekuRead)]
 pub struct Object<C: CpioHeader> {
     pub header: C,
-
-    #[deku(assert = "name.as_bytes().len() == header.namesize() as usize - 1")]
-    pub name: CString,
-
-    #[deku(count = "pad_to_4(6 + header.namesize() as usize)")]
-    name_pad: Vec<u8>,
-
     #[deku(ctx = "header.filesize()")]
     data: Data,
+    #[deku(count = "header.data_pad()")]
+    data_pad: Vec<u8>,
 }
 
 impl<C: CpioHeader> Object<C> {
-    pub fn new(header: C, name: CString, name_pad: Vec<u8>, data: Data) -> Self {
-        Self { header, name, name_pad, data }
+    pub fn new(header: C, data: Data) -> Self {
+        let data_pad = vec![0; header.data_pad()];
+        Self { header, data, data_pad }
     }
 }
 
@@ -349,14 +344,109 @@ impl<C: CpioHeader> MutWriter for Object<C> {
         _: (),
     ) -> core::result::Result<(), DekuError> {
         DekuWriter::to_writer(&self.header, deku_writer, ())?;
-
-        if self.name.as_bytes().len() != self.header.namesize() as usize - 1 {
-            panic!("add assert here");
-        }
-        DekuWriter::to_writer(&self.name, deku_writer, ())?;
-        DekuWriter::to_writer(&self.name_pad, deku_writer, ())?;
         self.data.to_mutwriter(deku_writer, self.header.filesize())?;
         Ok(())
+    }
+}
+
+pub const ODC_MAGIC: &[u8] = b"070707";
+
+#[derive(DekuWrite, DekuRead, Debug)]
+pub struct OdcHeader {
+    #[deku(assert_eq = "ODC_MAGIC")]
+    pub magic: [u8; 6],
+    pub dev: Octal<u32, 6>,
+    pub ino: Octal<u32, 6>,
+    pub mode: Octal<u32, 6>,
+    pub uid: Octal<u32, 6>,
+    pub gid: Octal<u32, 6>,
+    pub nlink: Octal<u32, 6>,
+    pub rdev: Octal<u32, 6>,
+    pub mtime: Octal<u64, 11>,
+    pub namesize: Octal<u32, 6>,
+    pub filesize: Octal<u64, 11>,
+    #[deku(count = "namesize.value")]
+    pub name: Vec<u8>,
+}
+
+impl CpioHeader for OdcHeader {
+    fn from_header(header: Header, filesize: u64) -> Self {
+        let name_bytes = header.name.into_bytes();
+        let name_len = name_bytes.len();
+        Self {
+            magic: ODC_MAGIC.try_into().unwrap(),
+            dev: Octal::new(header.devmajor),
+            ino: Octal::new(header.ino),
+            mode: Octal::new(header.mode),
+            uid: Octal::new(header.uid),
+            gid: Octal::new(header.gid),
+            nlink: Octal::new(header.nlink),
+            rdev: Octal::new(header.devminor),
+            mtime: Octal::new(header.mtime.into()),
+            namesize: Octal::new(name_len as u32),
+            filesize: Octal::new(filesize),
+            name: name_bytes.to_vec(),
+        }
+    }
+
+    fn into_header(&self) -> Header {
+        Header {
+            ino: self.ino(),
+            mode: self.mode(),
+            uid: self.uid(),
+            gid: self.gid(),
+            nlink: self.nlink(),
+            mtime: self.mtime(),
+            devmajor: self.devmajor(),
+            devminor: self.devminor(),
+            rdevmajor: 0,
+            rdevminor: 0,
+            name: self.name().to_string(),
+        }
+    }
+
+    fn ino(&self) -> u32 {
+        self.ino.value
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.value
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid.value
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.value
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.value
+    }
+
+    fn mtime(&self) -> u32 {
+        self.mtime.value as u32
+    }
+
+    fn filesize(&self) -> u32 {
+        self.filesize.value as u32
+    }
+
+    fn namesize(&self) -> u32 {
+        self.namesize.value
+    }
+
+    // fn check(&self) -> u32 {
+    //     todo!()
+    // }
+
+    fn name(&self) -> &str {
+        CStr::from_bytes_with_nul(&self.name).unwrap().to_str().unwrap()
+    }
+
+    fn data_pad(&self) -> usize {
+        0
     }
 }
 
@@ -378,10 +468,18 @@ pub struct NewcHeader {
     pub rdevminor: Ascii,
     pub namesize: Ascii,
     pub check: Ascii,
+    // #[deku(assert = "name.as_bytes().len() == header.namesize.value as usize - 1")]
+    // pub name: CString,
+    #[deku(count = "namesize.value")]
+    pub name: Vec<u8>,
+    #[deku(count = "pad_to_4(6 + namesize.value as usize)")]
+    name_pad: Vec<u8>,
 }
 
 impl CpioHeader for NewcHeader {
-    fn from_header(header: Header, namesize: u32, filesize: u64) -> Self {
+    fn from_header(header: Header, filesize: u64) -> Self {
+        let name_bytes = header.name.into_bytes();
+        let name_len = name_bytes.len();
         NewcHeader {
             magic: MAGIC,
             ino: Ascii::new(header.ino),
@@ -395,10 +493,29 @@ impl CpioHeader for NewcHeader {
             devminor: Ascii::new(header.devminor),
             rdevmajor: Ascii::new(header.rdevmajor),
             rdevminor: Ascii::new(header.rdevminor),
-            namesize: Ascii::new(namesize),
+            namesize: Ascii::new(name_len as u32 + 1),
             check: Ascii::new(0),
+            name: name_bytes.to_vec(),
+            name_pad: vec![0; pad_to_4(6 + name_len as usize)],
         }
     }
+
+    fn into_header(&self) -> Header {
+        Header {
+            ino: self.ino(),
+            mode: self.mode(),
+            uid: self.uid(),
+            gid: self.gid(),
+            nlink: self.nlink(),
+            mtime: self.mtime(),
+            devmajor: self.devmajor.value,
+            devminor: self.devminor.value,
+            rdevmajor: 0,
+            rdevminor: 0,
+            name: self.name().to_string(),
+        }
+    }
+
     fn ino(&self) -> u32 {
         self.ino.value
     }
@@ -435,13 +552,13 @@ impl CpioHeader for NewcHeader {
         self.devminor.value
     }
 
-    fn rdevmajor(&self) -> u32 {
-        self.rdevmajor.value
-    }
+    // fn rdevmajor(&self) -> u32 {
+    //     self.rdevmajor.value
+    // }
 
-    fn rdevminor(&self) -> u32 {
-        self.rdevminor.value
-    }
+    // fn rdevminor(&self) -> u32 {
+    //     self.rdevminor.value
+    // }
 
     fn namesize(&self) -> u32 {
         self.namesize.value
@@ -450,6 +567,14 @@ impl CpioHeader for NewcHeader {
     fn check(&self) -> u32 {
         self.check.value
     }
+
+    fn name(&self) -> &str {
+        CStr::from_bytes_with_nul(&self.name).unwrap().to_str().unwrap()
+    }
+
+    fn data_pad(&self) -> usize {
+        pad_to_4(self.filesize() as usize)
+    }
 }
 
 /// pad out to a multiple of 4 bytes
@@ -457,6 +582,73 @@ fn pad_to_4(len: usize) -> usize {
     match len % 4 {
         0 => 0,
         x => 4 - x,
+    }
+}
+
+trait OctalConversion {
+    fn to_octal_bytes(&self) -> Vec<u8>;
+    fn from_octal_string(s: &str) -> Self;
+}
+
+impl<T> OctalConversion for T
+where
+    T: num_traits::PrimInt + num_traits::Zero + Debug,
+{
+    // Convert any integer type into an octal string
+    fn to_octal_bytes(&self) -> Vec<u8> {
+        let mut num = *self;
+        let mut result = Vec::new();
+
+        while num > T::zero() {
+            let remainder = (num % T::from(8).unwrap()).to_u8().unwrap();
+            result.push((b'0' + remainder) as u8);
+            num = num / T::from(8).unwrap();
+        }
+
+        if result.is_empty() {
+            result.push(b'0');
+        }
+
+        result.reverse();
+        result
+    }
+
+    // Convert an octal string back to the integer type
+    fn from_octal_string(s: &str) -> Self {
+        let a = match T::from_str_radix(s, 8) {
+            Ok(value) => value,
+            Err(_) => T::zero(), // Or handle the error appropriately
+        };
+        dbg!(a);
+        a
+    }
+}
+
+#[derive(DekuWrite, DekuRead, Debug, Copy, Clone, Default)]
+pub struct Octal<T: OctalConversion + fmt::Debug, const N: usize> {
+    #[deku(reader = "Self::read(deku::reader)", writer = "self.write(deku::writer)")]
+    pub value: T,
+}
+
+impl<T: OctalConversion + fmt::Debug, const N: usize> Octal<T, N> {
+    pub fn new(value: T) -> Self {
+        Self { value }
+    }
+
+    fn read<R: Read + Seek>(reader: &mut Reader<R>) -> Result<T, DekuError> {
+        let value = <[u8; N]>::from_reader_with_ctx(reader, ())?;
+        let s = std::str::from_utf8(&value).unwrap();
+        dbg!(&s);
+        let value = T::from_octal_string(s);
+        dbg!(&value);
+        Ok(value)
+    }
+
+    fn write<W: Write + Seek>(&self, writer: &mut Writer<W>) -> Result<(), DekuError> {
+        let bytes = self.value.to_octal_bytes();
+        writer.write_bytes(&bytes)?;
+
+        Ok(())
     }
 }
 
@@ -485,7 +677,6 @@ impl Ascii {
         for b in bytes {
             let left = (b & 0xf0) >> 4;
             let right = b & 0x0f;
-
             let left = if left > 9 { left + 0x37 } else { left + 0x30 };
             let right = if right > 9 { right + 0x37 } else { right + 0x30 };
 
